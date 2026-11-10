@@ -14,10 +14,22 @@ module.exports = async (req, res) => {
     req.on('end', resolve);
     req.on('error', reject);
   });
-  const body = chunks.length ? Buffer.concat(chunks) : undefined;
+
+  let body = chunks.length ? Buffer.concat(chunks) : undefined;
+
+  // Force stream:true on chat completions so response trickles back
+  // and keeps the Vercel connection alive token by token
+  if (body && req.url.includes('/chat/completions')) {
+    try {
+      const parsed = JSON.parse(body.toString());
+      parsed.stream = true;
+      body = Buffer.from(JSON.stringify(parsed));
+    } catch {}
+  }
 
   const headers = { ...req.headers };
   delete headers['host'];
+  if (body) headers['content-length'] = String(body.length);
 
   try {
     const upstream = await fetch(url, {
@@ -26,13 +38,18 @@ module.exports = async (req, res) => {
       body: body?.length ? body : undefined,
     });
 
-    res.status(upstream.status);
     upstream.headers.forEach((v, k) => {
       if (!['transfer-encoding', 'connection'].includes(k)) res.setHeader(k, v);
     });
+    res.status(upstream.status);
 
-    const data = await upstream.arrayBuffer();
-    res.end(Buffer.from(data));
+    const reader = upstream.body.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      res.write(Buffer.from(value));
+    }
+    res.end();
   } catch (e) {
     res.status(502).json({ error: e.message });
   }
